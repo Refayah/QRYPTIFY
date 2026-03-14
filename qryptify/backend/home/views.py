@@ -611,7 +611,8 @@ class AnalyzeUserInputAPI(APIView):
             if data_bits:
                 feed_model=nist_statistical_test(data_bits)
                 if feed_model:
-                    return Response(feed_model)
+                    print(feed_model)
+                    return Response({"status":True,"predicted_results":feed_model})
                 else:
                     return Response({"status":False,"message":"Error in feeding the data to the model"})
             else:

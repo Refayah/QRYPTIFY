@@ -4,16 +4,18 @@ import math
 import scipy.special as ss
 from scipy.stats import norm, entropy
 import warnings
-import os
-from tqdm import tqdm
+from .xgboost_model import *
 import zlib
 from scipy.stats import skew
+from scipy.signal import welch
 from scipy.fft import rfft, rfftfreq
 import hashlib
+import os
 from numba import jit
-from .predict import *
-warnings.filterwarnings('ignore')
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 
+warnings.filterwarnings('ignore')
 
 class BinaryData:
     def __init__(self, bit_string):
@@ -21,11 +23,15 @@ class BinaryData:
         padding = (8 - n % 8) % 8
         if padding > 0:
             bit_string += '0' * padding
+
+        # pack bits to bytes efficiently
         n_bytes = len(bit_string) // 8
         packed_bytes = int(bit_string, 2).to_bytes(n_bytes, 'big')
         self.packed = np.frombuffer(packed_bytes, dtype=np.uint8)
         self.unpacked = np.unpackbits(self.packed)[:n]
         self.n = n
+
+        # Cache commonly used values
         self._ones_count = None
         self._byte_counts = None
 
@@ -340,25 +346,20 @@ def byte_entropy(binary):
 def byte_histogram_features(binary):
     if len(binary.packed) == 0:
         return 0.0, 0.0, 0.0, 0.0
-
     counts = binary.byte_counts.astype(np.float64)
     probs = counts / counts.sum()
-
     expected = counts.sum() / 256.0
     chi2 = np.sum((counts - expected) ** 2 / (expected + 1e-12))
-
     max_p = probs.max()
     std_p = probs.std()
     mean_p = probs.mean()
     cv = std_p / (mean_p + 1e-12)
-
     return chi2, max_p, std_p, cv
 
 def run_length_features(binary):
     bits = binary.unpacked
     if len(bits) == 0:
         return 0.0, 0.0, 0.0, 0.0
-
     runs = []
     current = bits[0]
     length = 1
@@ -370,44 +371,36 @@ def run_length_features(binary):
             current = b
             length = 1
     runs.append(length)
-
     runs = np.array(runs, dtype=np.float64)
-
     run_mean = runs.mean()
     run_std = runs.std()
     run_max = runs.max()
     run_cv = run_std / (run_mean + 1e-12)
-
     return run_mean, run_std, run_max, run_cv
 
 def autocorrelation_features(binary):
     bits = binary.unpacked.astype(np.int8)
     if len(bits) < 10:
         return 0.0, 0.0, 0.0, 0.0
-
     x = 2 * bits - 1
     lags = [1, 2, 4, 8]
     acf_values = []
-
     for lag in lags:
         if len(x) <= lag:
             acf_values.append(0.0)
         else:
             acf = np.dot(x[:-lag], x[lag:]) / (len(x) - lag)
             acf_values.append(float(acf))
-
     return tuple(acf_values)
 
 def complexity_features(binary):
     bits = binary.unpacked
     if len(bits) == 0:
         return 0.0, 0.0
-
     n = len(bits)
     complexity = 0
     i = 0
     prefix_dict = set()
-
     while i < n:
         for j in range(i + 1, min(i + 100, n + 1)):
             substring = tuple(bits[i:j])
@@ -418,9 +411,7 @@ def complexity_features(binary):
                 break
         else:
             i += 1
-
     lz_complexity = complexity / (n / np.log2(n + 1) + 1e-12)
-
     if n >= 8:
         patterns = set()
         for i in range(n - 7):
@@ -429,63 +420,49 @@ def complexity_features(binary):
         compression_ratio = len(patterns) / (n - 7)
     else:
         compression_ratio = 1.0
-
     return lz_complexity, compression_ratio
 
 def bit_transition_features(binary):
     bits = binary.unpacked
     if len(bits) < 2:
         return 0.0, 0.0, 0.0
-
     transitions = np.diff(bits.astype(np.int8))
     zero_to_one = np.sum(transitions == 1)
     one_to_zero = np.sum(transitions == -1)
-
     total_trans = zero_to_one + one_to_zero
     transition_rate = total_trans / (len(bits) - 1)
     transition_balance = abs(zero_to_one - one_to_zero) / (total_trans + 1e-12)
-
     p = binary.ones_count / binary.n
     expected_transitions = 2 * p * (1 - p) * (binary.n - 1)
     transition_deviation = abs(total_trans - expected_transitions) / (expected_transitions + 1e-12)
-
     return transition_rate, transition_balance, transition_deviation
 
 def spectral_features(binary):
     bits = binary.unpacked
     if len(bits) < 100:
         return 0.0, 0.0, 0.0
-
     x = 2 * bits.astype(np.float64) - 1
     fft_vals = np.fft.fft(x)
     power_spectrum = np.abs(fft_vals[:len(fft_vals)//2])**2
-
     ps_norm = power_spectrum / (power_spectrum.sum() + 1e-12)
     spectral_entropy = entropy(ps_norm + 1e-12, base=2)
-
     max_power = power_spectrum.max()
     mean_power = power_spectrum.mean()
     dominant_freq_ratio = max_power / (mean_power + 1e-12)
-
     geometric_mean = np.exp(np.mean(np.log(power_spectrum + 1e-12)))
     arithmetic_mean = np.mean(power_spectrum)
     spectral_flatness = geometric_mean / (arithmetic_mean + 1e-12)
-
     return spectral_entropy, dominant_freq_ratio, spectral_flatness
 
 def local_randomness_features(binary):
     bits = binary.unpacked
     n = len(bits)
-
     if n < 1000:
         return 0.0, 0.0
-
     block_size = min(500, n // 10)
     n_blocks = n // block_size
-
     block_entropies = []
     block_ones_ratios = []
-
     for i in range(n_blocks):
         block = bits[i*block_size:(i+1)*block_size]
         ones = np.sum(block)
@@ -497,244 +474,9 @@ def local_randomness_features(binary):
             H = 0.0
         block_entropies.append(H)
         block_ones_ratios.append(p1)
-
     entropy_variance = np.var(block_entropies)
     ones_ratio_variance = np.var(block_ones_ratios)
-
     return entropy_variance, ones_ratio_variance
-
-def bits_string_to_bytes(bits_str):
-    bits_str = str(bits_str).strip().replace('\n', '').replace(' ', '')
-    if not all(c in '01' for c in bits_str):
-        return np.zeros(128, dtype=np.uint8)
-    remainder = len(bits_str) % 8
-    if remainder != 0:
-        bits_str += '0' * (8 - remainder)
-    num_bytes = len(bits_str) // 8
-    bytes_array = np.zeros(num_bytes, dtype=np.uint8)
-    for i in range(num_bytes):
-        byte_bits = bits_str[i*8:(i+1)*8]
-        bytes_array[i] = int(byte_bits, 2)  
-    return bytes_array
-
-
-def calculate_entropy(data):
-    if len(data) == 0:
-        return 0
-    
-    if isinstance(data, bytes):
-        data = np.frombuffer(data, dtype=np.uint8)
-    
-    byte_counts = np.bincount(data, minlength=256)
-    probabilities = byte_counts / len(data)
-    entropy = -np.sum([p * np.log2(p) for p in probabilities if p > 0])
-    return entropy
-
-
-def extract_block_cipher_features(ciphertext, block_size=16):
-    features = {}
-    if isinstance(ciphertext, bytes):
-        ciphertext = np.frombuffer(ciphertext, dtype=np.uint8)
-    blocks = [tuple(ciphertext[i:i+block_size]) 
-              for i in range(0, len(ciphertext), block_size)
-              if len(ciphertext[i:i+block_size]) == block_size]
-    if len(blocks) > 0:
-        unique_blocks = len(set(blocks))
-        total_blocks = len(blocks)
-        features['block_uniqueness_ratio'] = unique_blocks / total_blocks
-    else:
-        features['block_uniqueness_ratio'] = 0
-    if len(ciphertext) >= block_size and len(ciphertext) % block_size == 0:
-        last_byte = ciphertext[-1]
-        
-        if 0 < last_byte <= block_size:
-            padding_bytes = ciphertext[-last_byte:]
-            features['potential_padding_value'] = last_byte
-            features['padding_consistency'] = (
-                np.sum(padding_bytes == last_byte) / last_byte
-            )
-        else:
-            features['potential_padding_value'] = 0
-            features['padding_consistency'] = 0
-    else:
-        features['potential_padding_value'] = 0
-        features['padding_consistency'] = 0
-    if len(blocks) > 1:
-        correlations = []
-        for i in range(len(blocks) - 1):
-            block1 = np.array(blocks[i])
-            block2 = np.array(blocks[i+1])
-            xor_result = np.bitwise_xor(block1, block2)
-            correlation_score = np.sum(xor_result) / (block_size * 255)
-            correlations.append(correlation_score)
-        
-        features['mean_block_correlation'] = np.mean(correlations)
-        features['std_block_correlation'] = np.std(correlations)
-    else:
-        features['mean_block_correlation'] = 0
-        features['std_block_correlation'] = 0
-    features['length_mod_blocksize'] = len(ciphertext) % block_size
-    if len(ciphertext) >= block_size:
-        last_block = ciphertext[-block_size:]
-        features['last_block_entropy'] = calculate_entropy(last_block)
-    else:
-        features['last_block_entropy'] = 0
-    if len(ciphertext) >= block_size:
-        first_block = ciphertext[:block_size]
-        features['first_block_entropy'] = calculate_entropy(first_block)
-    else:
-        features['first_block_entropy'] = 0
-    return features
-
-def extract_stream_cipher_features(ciphertext):
-    features = {}
-    if isinstance(ciphertext, bytes):
-        ciphertext = np.frombuffer(ciphertext, dtype=np.uint8)
-    if len(ciphertext) >= 256:
-        prefix = ciphertext[:256]
-        features['prefix_bias_score'] = abs(np.mean(prefix) - 127.5)
-        features['prefix_std'] = np.std(prefix)
-        features['first_byte_is_zero'] = 1 if prefix[0] == 0 else 0
-        features['byte_255_value'] = int(prefix[255]) if len(prefix) > 255 else 0
-    else:
-        features['prefix_bias_score'] = 0
-        features['prefix_std'] = 0
-        features['first_byte_is_zero'] = 0
-        features['byte_255_value'] = 0
-    chunk_size = 64
-    chunks_64 = [ciphertext[i:i+chunk_size] 
-                 for i in range(0, len(ciphertext), chunk_size)
-                 if len(ciphertext[i:i+chunk_size]) == chunk_size]
-    
-    if len(chunks_64) > 1:
-        chunk_entropies = [calculate_entropy(chunk) for chunk in chunks_64]
-        features['chunk64_entropy_mean'] = np.mean(chunk_entropies)
-        features['chunk64_entropy_std'] = np.std(chunk_entropies)
-    else:
-        features['chunk64_entropy_mean'] = 0
-        features['chunk64_entropy_std'] = 0
-    if len(ciphertext) > 0:
-        byte_counts = np.bincount(ciphertext, minlength=256)
-        byte_freq = byte_counts / len(ciphertext)
-        
-        features['max_byte_freq'] = np.max(byte_freq)
-        features['min_byte_freq'] = np.min(byte_freq[byte_freq > 0]) if np.any(byte_freq > 0) else 0
-        features['byte_freq_range'] = features['max_byte_freq'] - features['min_byte_freq']
-        
-        expected_freq = 1 / 256
-        tolerance = 0.001
-        features['unusual_byte_count'] = int(np.sum(np.abs(byte_freq - expected_freq) > tolerance))
-    else:
-        features['max_byte_freq'] = 0
-        features['min_byte_freq'] = 0
-        features['byte_freq_range'] = 0
-        features['unusual_byte_count'] = 0
-    if len(ciphertext) > 0:
-        high_bit_count = np.sum(ciphertext >= 128)
-        features['high_bit_ratio'] = high_bit_count / len(ciphertext)
-        
-        low_bit_count = np.sum(ciphertext % 2 == 1)
-        features['low_bit_ratio'] = low_bit_count / len(ciphertext)
-    else:
-        features['high_bit_ratio'] = 0
-        features['low_bit_ratio'] = 0
-    if len(ciphertext) > 1:
-        runs = 0
-        current_run = 1
-        for i in range(1, len(ciphertext)):
-            if ciphertext[i] > ciphertext[i-1]:
-                current_run += 1
-            else:
-                if current_run >= 3:
-                    runs += 1
-                current_run = 1
-        features['long_run_count'] = runs
-    else:
-        features['long_run_count'] = 0
-    
-    return features
-
-def extract_hybrid_features(ciphertext):
-    features = {}
-    if isinstance(ciphertext, bytes):
-        ciphertext = np.frombuffer(ciphertext, dtype=np.uint8)
-    features['ciphertext_length'] = len(ciphertext)
-    if len(ciphertext) < 500:
-        features['length_category'] = 0
-    elif 500 <= len(ciphertext) < 1000:
-        features['length_category'] = 1
-    elif 1000 <= len(ciphertext) < 5000:
-        features['length_category'] = 2
-    else:
-        features['length_category'] = 3
-    
-    features['length_bucket'] = len(ciphertext) // 100
-    split_points = [256, 512, 768, 1024, 2048]
-    
-    for split in split_points:
-        if len(ciphertext) > split:
-            first_part = ciphertext[:split]
-            second_part = ciphertext[split:]
-            
-            first_entropy = calculate_entropy(first_part)
-            second_entropy = calculate_entropy(second_part)
-            
-            features[f'entropy_split_{split}_first'] = first_entropy
-            features[f'entropy_split_{split}_second'] = second_entropy
-            features[f'entropy_split_{split}_ratio'] = (
-                first_entropy / (second_entropy + 1e-6)
-            )
-        else:
-            features[f'entropy_split_{split}_first'] = 0
-            features[f'entropy_split_{split}_second'] = 0
-            features[f'entropy_split_{split}_ratio'] = 0
-    if len(ciphertext) > 1024:
-        split = min(1024, len(ciphertext) // 2)
-        first_part = ciphertext[:split]
-        second_part = ciphertext[split:]
-        
-        first_freq = np.bincount(first_part, minlength=256) / len(first_part)
-        second_freq = np.bincount(second_part, minlength=256) / len(second_part)
-        
-        kl_divergence = np.sum(
-            first_freq * np.log((first_freq + 1e-10) / (second_freq + 1e-10))
-        )
-        features['kl_divergence_first_second'] = kl_divergence
-        
-        chi_square = np.sum(
-            (first_freq - second_freq) ** 2 / (second_freq + 1e-10)
-        )
-        features['chi_square_first_second'] = chi_square
-    else:
-        features['kl_divergence_first_second'] = 0
-        features['chi_square_first_second'] = 0
-    if len(ciphertext) >= 16:
-        first_16 = ciphertext[:16]
-        features['first_16_zero_count'] = int(np.sum(first_16 == 0))
-        features['has_asn1_marker'] = 1 if first_16[0] == 0x30 else 0
-        features['first_16_entropy'] = calculate_entropy(first_16)
-    else:
-        features['first_16_zero_count'] = 0
-        features['has_asn1_marker'] = 0
-        features['first_16_entropy'] = 0
-    if len(ciphertext) >= 256:
-        first_chunk = int.from_bytes(ciphertext[:256].tobytes(), 'big')
-        
-        small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23]
-        features['divisible_by_small_primes'] = sum(
-            1 for p in small_primes if first_chunk % p == 0
-        )
-        
-        bit_count = bin(first_chunk).count('1')
-        features['first_chunk_bit_density'] = bit_count / 2048
-    else:
-        features['divisible_by_small_primes'] = 0
-        features['first_chunk_bit_density'] = 0
-    features['length_mod_16'] = len(ciphertext) % 16
-    features['length_mod_32'] = len(ciphertext) % 32
-    features['length_mod_64'] = len(ciphertext) % 64
-    return features
-
 
 WINDOW_SIZE = 1024
 WINDOW_STEP = 512
@@ -764,31 +506,42 @@ def fast_run_lengths(bitstream):
     runs = np.diff(transitions).astype(np.float64)
     return np.mean(runs), np.var(runs)
 
-def sliding_window_features_fast(bitstream):
-    n_windows = (len(bitstream) - WINDOW_SIZE) // WINDOW_STEP + 1
-    if n_windows < 1:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-    entropies = np.zeros(n_windows)
-    for i in range(n_windows):
-        start = i * WINDOW_STEP
-        window = bitstream[start:start + WINDOW_SIZE]
-        entropies[i] = fast_entropy(window)
-    run_mean, run_var = fast_run_lengths(bitstream)
-    ent_mean = float(np.mean(entropies))
-    ent_var  = float(np.var(entropies))
-    ent_skew = float(skew(entropies)) if len(entropies) >= 3 else 0.0
-    return ent_mean, ent_var, ent_skew, float(run_mean), float(run_var)
+# @jit(nopython=True, cache=True)
+# def sliding_window_features_fast(bitstream):
+#     """Optimized sliding window with numba"""
+#     n_windows = (len(bitstream) - WINDOW_SIZE) // WINDOW_STEP + 1
+#     entropies = np.zeros(n_windows)
+    
+#     for i in range(n_windows):
+#         start = i * WINDOW_STEP
+#         window = bitstream[start:start + WINDOW_SIZE]
+#         entropies[i] = fast_entropy(window)
+    
+#     run_mean, run_var = fast_run_lengths(bitstream)
+    
+#     return (
+#         np.mean(entropies),
+#         np.var(entropies),
+#         0.0 if len(entropies) < 3 else skew(entropies),  # skew computed outside numba
+#         run_mean,
+#         run_var
+#     )
 
 @jit(nopython=True, cache=True)
 def markov_features_fast(bitstream):
+    """Optimized Markov transition matrix"""
     transitions = np.zeros((2, 2), dtype=np.float64)
     
     for i in range(len(bitstream) - 1):
         transitions[bitstream[i], bitstream[i + 1]] += 1
+    
+    # Row normalization
     row_sums = transitions.sum(axis=1)
     for i in range(2):
         if row_sums[i] > 0:
             transitions[i] = transitions[i] / row_sums[i]
+    
+    # Flatten and calculate entropy
     probs = transitions.flatten()
     ent = 0.0
     for p in probs:
@@ -798,11 +551,15 @@ def markov_features_fast(bitstream):
     return transitions[0, 0], transitions[0, 1], transitions[1, 0], transitions[1, 1], ent
 
 def spectral_features_fast(bitstream):
+    """Optimized spectral features using FFT"""
+    # Downsample if too large
     if len(bitstream) > 100000:
         step = len(bitstream) // 50000
         signal = (bitstream[::step] * 2 - 1).astype(np.float32)
     else:
         signal = (bitstream * 2 - 1).astype(np.float32)
+    
+    # Use FFT instead of welch for speed
     fft_vals = np.abs(rfft(signal))
     freqs = rfftfreq(len(signal), d=1.0)
     
@@ -813,6 +570,8 @@ def spectral_features_fast(bitstream):
         return 0.0, 0.0, 0.0, 0.0, 0.0
     
     psd_norm = psd / psd_sum
+    
+    # Spectral features
     centroid = np.sum(freqs * psd_norm)
     flatness = np.exp(np.mean(np.log(psd + 1e-12))) / (np.mean(psd) + 1e-12)
     energy = psd_sum
@@ -826,6 +585,8 @@ def spectral_features_fast(bitstream):
     return centroid, flatness, energy, low_energy, high_energy
 
 def compression_features_fast(bitstream):
+    """Optimized compression - sample for large streams"""
+    # Sample if too large (compression is slow)
     if len(bitstream) > 100000:
         step = len(bitstream) // 50000
         sample = bitstream[::step]
@@ -833,12 +594,13 @@ def compression_features_fast(bitstream):
         sample = bitstream
     
     byte_data = np.packbits(sample).tobytes()
-    compressed = zlib.compress(byte_data, level=1) 
+    compressed = zlib.compress(byte_data, level=1)  # Fast compression level
     
     return len(compressed) / len(byte_data)
 
 @jit(nopython=True, cache=True)
 def differential_features_fast(bitstream):
+    """Optimized differential Hamming distance"""
     n_blocks = (len(bitstream) - 2 * DIFF_BLOCK_SIZE) // DIFF_BLOCK_SIZE
     
     if n_blocks < 1:
@@ -854,127 +616,46 @@ def differential_features_fast(bitstream):
     
     return np.mean(hamming), np.var(hamming)
 
-def extract_bitstream_features(bitstream):
-    features = {}
-    
-    win_ent_mean, win_ent_var, win_ent_skew, run_mean, run_var = sliding_window_features_fast(bitstream)
-    features["win_entropy_mean"] = win_ent_mean
-    features["win_entropy_var"] = win_ent_var
-    features["win_entropy_skew"] = win_ent_skew
-    features["run_length_mean"] = run_mean
-    features["run_length_var"] = run_var
-    
-    p00, p01, p10, p11, trans_ent = markov_features_fast(bitstream)
-    features["p00"] = p00
-    features["p01"] = p01
-    features["p10"] = p10
-    features["p11"] = p11
-    features["transition_entropy"] = trans_ent
-    
-    spec_cent, spec_flat, spec_energy, low_freq, high_freq = spectral_features_fast(bitstream)
-    features["spectral_centroid"] = spec_cent
-    features["spectral_flatness"] = spec_flat
-    features["spectral_energy"] = spec_energy
-    features["low_freq_energy"] = low_freq
-    features["high_freq_energy"] = high_freq
-    
-    features["compression_ratio"] = compression_features_fast(bitstream)
-    
-    hamming_mean, hamming_var = differential_features_fast(bitstream)
-    features["hamming_mean"] = hamming_mean
-    features["hamming_var"] = hamming_var
-    
-    return features
-
-def process_single_row(args):
-    idx, bitstring = args
-    try:
-        bitstream = np.array(list(bitstring.strip()), dtype=np.uint8)
-        features = extract_bitstream_features(bitstream)
-        return features
-    except Exception as e:
-        print(f"   ⚠️  Error on row {idx}: {e}")
-        return {
-            "win_entropy_mean": 0.0, "win_entropy_var": 0.0, "win_entropy_skew": 0.0,
-            "run_length_mean": 0.0, "run_length_var": 0.0,
-            "p00": 0.0, "p01": 0.0, "p10": 0.0, "p11": 0.0, "transition_entropy": 0.0,
-            "spectral_centroid": 0.0, "spectral_flatness": 0.0, "spectral_energy": 0.0,
-            "low_freq_energy": 0.0, "high_freq_energy": 0.0,
-            "compression_ratio": 0.0, "hamming_mean": 0.0, "hamming_var": 0.0
-        }
-
-def make_sample_id(bitstring: str) -> str:
-    return hashlib.sha256(bitstring.encode()).hexdigest()[:16]
-
-def extract_all_features(ciphertext_bytes):
-    try:
-        features = {}
-        features.update(extract_block_cipher_features(ciphertext_bytes))
-        features.update(extract_stream_cipher_features(ciphertext_bytes))
-        features.update(extract_hybrid_features(ciphertext_bytes))
-        return features
-    
-    except Exception as e:
-        print(f"Error extracting features: {e}")
-        return get_empty_features()
-
-def get_empty_features():
-    dummy_ciphertext = np.zeros(2048, dtype=np.uint8)
-    features = extract_all_features(dummy_ciphertext)
-    return {k: 0 for k in features.keys()}
-
-def process_csv_with_bits(csv_path, bits_column='Encrypted_Data'):
-    print(f"\n[Processing] {os.path.basename(csv_path)}")
-    df = pd.read_csv(csv_path)
-    
-    if bits_column not in df.columns:
-        raise ValueError(f"Column '{bits_column}' not found in CSV!")
-    
-    print(f"✓ Found {len(df)} rows with '{bits_column}' column")
-
-    print(f"Extracting enhanced features...")
-    enhanced_features = []
-    
-    for idx, bits_str in tqdm(enumerate(df[bits_column]), total=len(df), desc="Processing"):
-        ciphertext_bytes = bits_string_to_bytes(bits_str)
-        features = extract_all_features(ciphertext_bytes)
-        enhanced_features.append(features)
-    df_features = pd.DataFrame(enhanced_features)
-    
-    print(f"✓ Extracted {len(df_features.columns)} features")
-    
-    return df_features
-
-
 def flatten_test_results(row):
     flattened = {}
+    
+    # Simple NIST tests - these match your column names
     simple_tests = [
-        'bits_testing', 'frequency_within_block', 'runs',
-        'longest_run_within_block', 'binary_matrix_rank',
-        'discrete_fourier_transform', 'maurers_universal_statistical',
+        'bits_testing', 
+        'frequency_within_block', 
+        'runs',
+        'longest_run_within_block', 
+        'binary_matrix_rank',
+        'discrete_fourier_transform', 
+        'maurers_universal_statistical',
         'cumulative_sums'
     ]
-
+    
     for test in simple_tests:
         if test in row:
             result = row[test]
             flattened[f'{test}_pvalue'] = float(result[0])
             flattened[f'{test}_pass'] = int(result[1])
-
+    
+    # Random excursions - your CSV has states from -4 to 4
     if 'random_excursions' in row:
         results = row['random_excursions']
-        for i, (p_val, success) in enumerate(results):
-            flattened[f'random_excursions_state{i-4}_pvalue'] = float(p_val)
-            flattened[f'random_excursions_state{i-4}_pass'] = int(success)
+        # Your CSV shows states -4 through 4
+        for i, (p_val, success) in enumerate(results[:9]):  # 9 states from -4 to 4
+            state = i - 4  # This gives -4, -3, -2, -1, 0, 1, 2, 3, 4
+            flattened[f'random_excursions_state{state}_pvalue'] = float(p_val)
+            flattened[f'random_excursions_state{state}_pass'] = int(success)
 
+    # Random excursions variant - your CSV has states -9 through 9 (excluding 0)
     if 'random_excursions_variant' in row:
         results = row['random_excursions_variant']
-        states = list(range(-9, 0)) + list(range(1, 10))
-        for i, (p_val, success) in enumerate(results[:18]):
+        states = list(range(-9, 0)) + list(range(1, 10))  # -9 to -1, 1 to 9
+        for i, (p_val, success) in enumerate(results[:18]):  # 18 states
             state = states[i]
             flattened[f'random_excursions_variant_state{state}_pvalue'] = float(p_val)
             flattened[f'random_excursions_variant_state{state}_pass'] = int(success)
-
+    
+    # Feature mapping - make sure these match your CSV columns exactly
     feature_mapping = {
         'entropy_bits': 'entropy_bits',
         'entropy_bytes': 'entropy_bytes',
@@ -991,20 +672,15 @@ def flatten_test_results(row):
         'acf_lag4': 'acf_lag4',
         'acf_lag8': 'acf_lag8',
         'lz_complexity': 'lz_complexity',
-        'compression_ratio': 'compression_ratio',
+        'compression_ratio_x': 'compression_ratio_x',  # Note: your CSV has _x
         'transition_rate': 'transition_rate',
         'transition_balance': 'transition_balance',
         'transition_deviation': 'transition_deviation',
         'spectral_entropy': 'spectral_entropy',
         'dominant_freq_ratio': 'dominant_freq_ratio',
-        'spectral_flatness': 'spectral_flatness',
+        'spectral_flatness_x': 'spectral_flatness_x',  # Note: your CSV has _x
         'entropy_variance': 'entropy_variance',
         'ones_ratio_variance': 'ones_ratio_variance',
-        'compression_ratio':   'compression_ratio',
-        'compression_ratio_x': 'compression_ratio_x',
-        'spectral_flatness':   'spectral_flatness',
-        'spectral_flatness_x': 'spectral_flatness_x',
-        # Block cipher
         'block_uniqueness_ratio': 'block_uniqueness_ratio',
         'potential_padding_value': 'potential_padding_value',
         'padding_consistency': 'padding_consistency',
@@ -1013,7 +689,6 @@ def flatten_test_results(row):
         'length_mod_blocksize': 'length_mod_blocksize',
         'last_block_entropy': 'last_block_entropy',
         'first_block_entropy': 'first_block_entropy',
-        # Stream cipher
         'prefix_bias_score': 'prefix_bias_score',
         'prefix_std': 'prefix_std',
         'first_byte_is_zero': 'first_byte_is_zero',
@@ -1027,7 +702,6 @@ def flatten_test_results(row):
         'high_bit_ratio': 'high_bit_ratio',
         'low_bit_ratio': 'low_bit_ratio',
         'long_run_count': 'long_run_count',
-        # Hybrid
         'ciphertext_length': 'ciphertext_length',
         'length_category': 'length_category',
         'length_bucket': 'length_bucket',
@@ -1056,7 +730,7 @@ def flatten_test_results(row):
         'length_mod_16': 'length_mod_16',
         'length_mod_32': 'length_mod_32',
         'length_mod_64': 'length_mod_64',
-        # Numpy bitstream (_y suffix for conflicting names)
+        'sample_id': 'sample_id',
         'win_entropy_mean': 'win_entropy_mean',
         'win_entropy_var': 'win_entropy_var',
         'win_entropy_skew': 'win_entropy_skew',
@@ -1074,19 +748,41 @@ def flatten_test_results(row):
         'high_freq_energy': 'high_freq_energy',
         'compression_ratio_y': 'compression_ratio_y',
         'hamming_mean': 'hamming_mean',
-        'hamming_var': 'hamming_var',
+        'hamming_var': 'hamming_var'
     }
 
     for key, col_name in feature_mapping.items():
         if key in row:
-            flattened[col_name] = float(row[key])
+            flattened[col_name] = float(row[key]) if isinstance(row[key], (int, float)) else row[key]
+    
     return flattened
 
+@jit(nopython=True, cache=True)
+def sliding_window_features_fast(bitstream):
+    """Optimized sliding window with numba - returns entropies for skew calculation"""
+    n_windows = (len(bitstream) - WINDOW_SIZE) // WINDOW_STEP + 1
+    entropies = np.zeros(n_windows)
+    
+    for i in range(n_windows):
+        start = i * WINDOW_STEP
+        window = bitstream[start:start + WINDOW_SIZE]
+        entropies[i] = fast_entropy(window)
+    
+    run_mean, run_var = fast_run_lengths(bitstream)
+    
+    return (
+        np.mean(entropies),
+        np.var(entropies),
+        entropies,  # Return the entropies array
+        run_mean,
+        run_var
+    )
 
-def process_bitstream(row_dict,bits_column='Encrypted_Data'):
+def process_bitstream(bit_stream):
     try:
-        bit_stream = BinaryData(row_dict['Encrypted_Data'])
-
+        # Get the unpacked bits array for Numba functions
+        bits = bit_stream.unpacked
+        
         nist_results = {
             "bits_testing": monobit_test(bit_stream),
             "frequency_within_block": frequency_within_block_test(bit_stream),
@@ -1099,8 +795,7 @@ def process_bitstream(row_dict,bits_column='Encrypted_Data'):
             "random_excursions": random_excursion_test(bit_stream),
             "random_excursions_variant": random_excursion_variant_test(bit_stream),
         }
-
-        # Enhanced Features
+        
         H_bits = shannon_entropy_bits(bit_stream)
         H_bytes = byte_entropy(bit_stream)
         chi2_bytes, max_p_byte, std_p_byte, cv_byte = byte_histogram_features(bit_stream)
@@ -1110,21 +805,45 @@ def process_bitstream(row_dict,bits_column='Encrypted_Data'):
         trans_rate, trans_balance, trans_dev = bit_transition_features(bit_stream)
         spec_entropy, dom_freq_ratio, spec_flatness = spectral_features(bit_stream)
         ent_var, ones_var = local_randomness_features(bit_stream)
-
-        # Ciphertext-level features (block, stream, hybrid)
-        ciphertext_bytes = bits_string_to_bytes(row_dict['Encrypted_Data'])
-        block_feats  = extract_block_cipher_features(ciphertext_bytes)
-        stream_feats = extract_stream_cipher_features(ciphertext_bytes)
-        hybrid_feats = extract_hybrid_features(ciphertext_bytes)
-
-        # Numpy bitstream features (sliding window, markov, spectral, hamming)
-        bitstream_np = bit_stream.unpacked
-        np_feats = extract_bitstream_features(bitstream_np)
-
-        if 'compression_ratio' in np_feats:
-            np_feats['compression_ratio_y'] = np_feats.pop('compression_ratio')
-        if 'spectral_flatness' in np_feats:
-            np_feats['spectral_flatness_y'] = np_feats.pop('spectral_flatness')
+        
+        features = {}
+        
+        # Sliding window features - using bits (NumPy array)
+        win_ent_mean, win_ent_var, entropies, run_len_mean, run_len_var = sliding_window_features_fast(bits)
+        
+        # Compute skew outside the numba function
+        from scipy.stats import skew
+        win_ent_skew = skew(entropies) if len(entropies) >= 3 else 0.0
+        
+        features["win_entropy_mean"] = win_ent_mean
+        features["win_entropy_var"] = win_ent_var
+        features["win_entropy_skew"] = win_ent_skew
+        features["run_length_mean"] = run_len_mean
+        features["run_length_var"] = run_len_var
+        
+        # Markov features - using bits
+        p00, p01, p10, p11, trans_ent = markov_features_fast(bits)
+        features["p00"] = p00
+        features["p01"] = p01
+        features["p10"] = p10
+        features["p11"] = p11
+        features["transition_entropy"] = trans_ent
+        
+        # Spectral features - using bits
+        spec_cent, spec_flat, spec_energy, low_freq, high_freq = spectral_features_fast(bits)
+        features["spectral_centroid"] = spec_cent
+        features["spectral_flatness_y"] = spec_flat
+        features["spectral_energy"] = spec_energy
+        features["low_freq_energy"] = low_freq
+        features["high_freq_energy"] = high_freq
+        
+        # Compression features - using bits
+        features["compression_ratio_y"] = compression_features_fast(bits)
+        
+        # Differential features - using bits
+        hamming_mean, hamming_var = differential_features_fast(bits)
+        features["hamming_mean"] = hamming_mean
+        features["hamming_var"] = hamming_var
 
         result = {
             **nist_results,
@@ -1143,98 +862,149 @@ def process_bitstream(row_dict,bits_column='Encrypted_Data'):
             "acf_lag4": acf4,
             "acf_lag8": acf8,
             "lz_complexity": lz_complexity,
-            "compression_ratio":   compression_ratio,
             "compression_ratio_x": compression_ratio,
             "transition_rate": trans_rate,
             "transition_balance": trans_balance,
             "transition_deviation": trans_dev,
             "spectral_entropy": spec_entropy,
             "dominant_freq_ratio": dom_freq_ratio,
-            "spectral_flatness":   spec_flatness,
             "spectral_flatness_x": spec_flatness,
             "entropy_variance": ent_var,
             "ones_ratio_variance": ones_var,
-            **block_feats,
-            **stream_feats,
-            **hybrid_feats,
-            **np_feats,
+            **features
         }
 
         return flatten_test_results(result)
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
-            "error": str(e)
+            "error": str(e),
         }
 
-EXPECTED_MODEL_COLUMNS = [
-    'bits_testing_pvalue',    'bits_testing_pass',    'frequency_within_block_pvalue',    'frequency_within_block_pass',
-    'runs_pvalue',    'runs_pass',    'longest_run_within_block_pvalue',    'longest_run_within_block_pass',
-    'binary_matrix_rank_pvalue',    'binary_matrix_rank_pass',    'discrete_fourier_transform_pvalue',    'discrete_fourier_transform_pass',
-    'maurers_universal_statistical_pvalue',    'maurers_universal_statistical_pass',    'cumulative_sums_pvalue',    'cumulative_sums_pass',
-    'random_excursions_state-4_pvalue',    'random_excursions_state-4_pass',    'random_excursions_state-3_pvalue',    'random_excursions_state-3_pass',
-    'random_excursions_state-2_pvalue',    'random_excursions_state-2_pass',    'random_excursions_state-1_pvalue',    'random_excursions_state-1_pass',
-    'random_excursions_state0_pvalue',    'random_excursions_state0_pass',    'random_excursions_state1_pvalue',    'random_excursions_state1_pass',
-    'random_excursions_state2_pvalue',    'random_excursions_state2_pass',    'random_excursions_state3_pvalue',    'random_excursions_state3_pass',
-    'random_excursions_state4_pvalue',    'random_excursions_state4_pass',    'random_excursions_variant_state-9_pvalue',    'random_excursions_variant_state-9_pass',
-    'random_excursions_variant_state-8_pvalue',    'random_excursions_variant_state-8_pass',    'random_excursions_variant_state-7_pvalue',    'random_excursions_variant_state-7_pass',
-    'random_excursions_variant_state-6_pvalue',    'random_excursions_variant_state-6_pass',    'random_excursions_variant_state-5_pvalue',    'random_excursions_variant_state-5_pass',
-    'random_excursions_variant_state-4_pvalue',    'random_excursions_variant_state-4_pass',    'random_excursions_variant_state-3_pvalue',    'random_excursions_variant_state-3_pass',
-    'random_excursions_variant_state-2_pvalue',    'random_excursions_variant_state-2_pass',    'random_excursions_variant_state-1_pvalue',    'random_excursions_variant_state-1_pass',
-    'random_excursions_variant_state1_pvalue',    'random_excursions_variant_state1_pass',    'random_excursions_variant_state2_pvalue',    'random_excursions_variant_state2_pass',
-    'random_excursions_variant_state3_pvalue',    'random_excursions_variant_state3_pass',    'random_excursions_variant_state4_pvalue',    'random_excursions_variant_state4_pass',
-    'random_excursions_variant_state5_pvalue',    'random_excursions_variant_state5_pass',    'random_excursions_variant_state6_pvalue',    'random_excursions_variant_state6_pass',
-    'random_excursions_variant_state7_pvalue',    'random_excursions_variant_state7_pass',    'random_excursions_variant_state8_pvalue',    'random_excursions_variant_state8_pass',
-    'random_excursions_variant_state9_pvalue',    'random_excursions_variant_state9_pass',    'entropy_bits',    'entropy_bytes',
-    'chi2_bytes',    'max_p_byte',    'std_p_byte',    'cv_byte',
-    'run_mean',    'run_std',    'run_max',    'run_cv',
-    'acf_lag1',    'acf_lag2',    'acf_lag4',    'acf_lag8',
-    'lz_complexity',    'compression_ratio_x',    'transition_rate',    'transition_balance',
-    'transition_deviation',    'spectral_entropy',    'dominant_freq_ratio',    'spectral_flatness_x',
-    'entropy_variance',    'ones_ratio_variance',    'block_uniqueness_ratio',    'potential_padding_value',
-    'padding_consistency',    'mean_block_correlation',    'std_block_correlation',    'length_mod_blocksize',
-    'last_block_entropy',    'first_block_entropy',    'prefix_bias_score',    'prefix_std',
-    'first_byte_is_zero',    'byte_255_value',    'chunk64_entropy_mean',    'chunk64_entropy_std',
-    'max_byte_freq',    'min_byte_freq',    'byte_freq_range',    'unusual_byte_count',
-    'high_bit_ratio',    'low_bit_ratio',    'long_run_count',    'ciphertext_length',
-    'length_category',    'length_bucket',    'entropy_split_256_first',    'entropy_split_256_second',
-    'entropy_split_256_ratio',    'entropy_split_512_first',    'entropy_split_512_second',    'entropy_split_512_ratio',
-    'entropy_split_768_first',    'entropy_split_768_second',    'entropy_split_768_ratio',    'entropy_split_1024_first',
-    'entropy_split_1024_second',    'entropy_split_1024_ratio',    'entropy_split_2048_first',    'entropy_split_2048_second',
-    'entropy_split_2048_ratio',    'kl_divergence_first_second',    'chi_square_first_second',    'first_16_zero_count',
-    'has_asn1_marker',    'first_16_entropy',    'divisible_by_small_primes',    'first_chunk_bit_density',
-    'length_mod_16',    'length_mod_32',    'length_mod_64',    'win_entropy_mean',
-    'win_entropy_var',    'win_entropy_skew',    'run_length_mean',    'run_length_var',
-    'p00',    'p01',    'p10',    'p11',
-    'transition_entropy',    'spectral_centroid',    'spectral_flatness_y',    'spectral_energy',
-    'low_freq_energy',    'high_freq_energy',    'compression_ratio_y',    'hamming_mean',
-    'hamming_var',
-]
+
+# def process_bitstream(bit_stream):
+#     try:
+#         # Get the unpacked bits array for Numba functions
+#         bits = bit_stream.unpacked
+        
+#         nist_results = {
+#             "bits_testing": monobit_test(bit_stream),
+#             "frequency_within_block": frequency_within_block_test(bit_stream),
+#             "runs": runs_test(bit_stream),
+#             "longest_run_within_block": longest_run_within_block_test(bit_stream),
+#             "binary_matrix_rank": binary_matrix_rank_test(bit_stream),
+#             "discrete_fourier_transform": discrete_fourier_transform_test(bit_stream),
+#             "maurers_universal_statistical": maurers_universal_test(bit_stream),
+#             "cumulative_sums": cumulative_sums_test(bit_stream),
+#             "random_excursions": random_excursion_test(bit_stream),
+#             "random_excursions_variant": random_excursion_variant_test(bit_stream),
+#         }
+        
+#         H_bits = shannon_entropy_bits(bit_stream)
+#         H_bytes = byte_entropy(bit_stream)
+#         chi2_bytes, max_p_byte, std_p_byte, cv_byte = byte_histogram_features(bit_stream)
+#         run_mean, run_std, run_max, run_cv = run_length_features(bit_stream)
+#         acf1, acf2, acf4, acf8 = autocorrelation_features(bit_stream)
+#         lz_complexity, compression_ratio = complexity_features(bit_stream)
+#         trans_rate, trans_balance, trans_dev = bit_transition_features(bit_stream)
+#         spec_entropy, dom_freq_ratio, spec_flatness = spectral_features(bit_stream)
+#         ent_var, ones_var = local_randomness_features(bit_stream)
+        
+#         features = {}
+        
+#         # Sliding window features - using bits (NumPy array)
+#         win_ent_mean, win_ent_var, win_ent_skew, run_len_mean, run_len_var = sliding_window_features_fast(bits)
+#         features["win_entropy_mean"] = win_ent_mean
+#         features["win_entropy_var"] = win_ent_var
+#         features["win_entropy_skew"] = win_ent_skew
+#         features["run_length_mean"] = run_len_mean
+#         features["run_length_var"] = run_len_var
+        
+#         # Markov features - using bits
+#         p00, p01, p10, p11, trans_ent = markov_features_fast(bits)
+#         features["p00"] = p00
+#         features["p01"] = p01
+#         features["p10"] = p10
+#         features["p11"] = p11
+#         features["transition_entropy"] = trans_ent
+        
+#         # Spectral features - using bits
+#         spec_cent, spec_flat, spec_energy, low_freq, high_freq = spectral_features_fast(bits)
+#         features["spectral_centroid"] = spec_cent
+#         features["spectral_flatness_y"] = spec_flat
+#         features["spectral_energy"] = spec_energy
+#         features["low_freq_energy"] = low_freq
+#         features["high_freq_energy"] = high_freq
+        
+#         # Compression features - using bits
+#         features["compression_ratio_y"] = compression_features_fast(bits)
+        
+#         # Differential features - using bits
+#         hamming_mean, hamming_var = differential_features_fast(bits)
+#         features["hamming_mean"] = hamming_mean
+#         features["hamming_var"] = hamming_var
+
+#         result = {
+#             **nist_results,
+#             "entropy_bits": H_bits,
+#             "entropy_bytes": H_bytes,
+#             "chi2_bytes": chi2_bytes,
+#             "max_p_byte": max_p_byte,
+#             "std_p_byte": std_p_byte,
+#             "cv_byte": cv_byte,
+#             "run_mean": run_mean,
+#             "run_std": run_std,
+#             "run_max": run_max,
+#             "run_cv": run_cv,
+#             "acf_lag1": acf1,
+#             "acf_lag2": acf2,
+#             "acf_lag4": acf4,
+#             "acf_lag8": acf8,
+#             "lz_complexity": lz_complexity,
+#             "compression_ratio_x": compression_ratio,
+#             "transition_rate": trans_rate,
+#             "transition_balance": trans_balance,
+#             "transition_deviation": trans_dev,
+#             "spectral_entropy": spec_entropy,
+#             "dominant_freq_ratio": dom_freq_ratio,
+#             "spectral_flatness_x": spec_flatness,
+#             "entropy_variance": ent_var,
+#             "ones_ratio_variance": ones_var,
+#             **features
+#         }
+
+#         return flatten_test_results(result)
+
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()
+#         return {
+#             "error": str(e),
+#         }
 
 def nist_statistical_test(bit_data: str):
-    nist_dict = process_bitstream({'Encrypted_Data': bit_data})
+    bit_stream = BinaryData(bit_data)   
+    nist_dict = process_bitstream(bit_stream)
 
     if "error" in nist_dict:
         raise RuntimeError(f"Error processing bitstream: {nist_dict['error']}")
 
-    nist_test_df = pd.DataFrame([nist_dict])
-    for col in EXPECTED_MODEL_COLUMNS:
-        if col not in nist_test_df.columns:
-            nist_test_df[col] = 0.0
-
-    nist_test_df = nist_test_df[EXPECTED_MODEL_COLUMNS]
-
-    print(f"\n✅ nist_dict has {len(nist_test_df.columns)} columns")
-    print(f"Column names sample (first 10): {list(nist_test_df.columns)}")
-
-    if len(nist_test_df.columns) == len(EXPECTED_MODEL_COLUMNS):
-        print(f"✓ Correct number of columns: {len(EXPECTED_MODEL_COLUMNS)}")
+    # QUICK ANALYSIS
+    print(f"\n✅ nist_dict has {len(nist_dict)} columns")
+    print(f"Column names sample (first 10): {list(nist_dict.keys())}")
+    
+    # Check if it has 185 columns (what your model expects)
+    expected_columns = 185
+    if len(nist_dict) == expected_columns:
+        print(f"✓ Correct number of columns: {len(nist_dict)}")
     else:
-        print(f"⚠ WARNING: Expected {len(EXPECTED_MODEL_COLUMNS)} columns but got {len(nist_test_df.columns)}")
-
-    nist_test_df.to_csv("nist_test_column_check.csv", index=False)
-    print(nist_test_df.head())
-    return predict(nist_test_df)
+        print(f"⚠ WARNING: Expected {expected_columns} columns but got {len(nist_dict)}")
+        print(f"Difference: {len(nist_dict) - expected_columns} extra/missing columns")
+    
+    nist_test_df = pd.DataFrame([nist_dict])
+    return feed_nist_data(nist_test_df)
 
 
 

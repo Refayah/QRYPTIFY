@@ -58,11 +58,11 @@ export default function HeroSection({ onNavigate, onGetStarted }) {
 
             <div className="flex items-center gap-8 pt-8">
               <div className="text-center">
-                <div className="text-2xl font-bold text-gray-900">25+</div>
+                <div className="text-2xl font-bold text-gray-900">20+</div>
                 <div className="text-sm text-gray-600">Algorithms Detected</div>
               </div>
               <div className="text-center">
-                <div className="text-2xl font-bold text-gray-900">85%</div>
+                <div className="text-2xl font-bold text-gray-900">80%</div>
                 <div className="text-sm text-gray-600">Accuracy Rate</div>
               </div>
               <div className="text-center">
