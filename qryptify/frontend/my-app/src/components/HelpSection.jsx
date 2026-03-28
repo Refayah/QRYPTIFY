@@ -163,6 +163,7 @@ export default function HelpSection() {
     }
   };
 
+
   const handleSendQuery = async () => {
     try {
       const send_mail = await api(

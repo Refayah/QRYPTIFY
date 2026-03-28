@@ -9,7 +9,8 @@ from home.views import (
     ResetPasswordAPI,
     DeleteAccountUserAPI,
     GetAccessTokenAPI,
-    GetLogsAPI
+    GetLogsAPI,
+    UsageLogAPI
     )
 
 
@@ -28,4 +29,5 @@ urlpatterns=[
     path('user-account-delete/',DeleteAccountUserAPI.as_view()),
     path('get-access-token/', GetAccessTokenAPI.as_view(), name='get-access-token'),
     path('getlogs/',GetLogsAPI.as_view()),
+    path('block-data/',UsageLogAPI.as_view())
 ]

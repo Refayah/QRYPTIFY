@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from home.models import User,AuditLog
 
+
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(max_length=128, write_only=True)  
     phone = serializers.CharField(max_length=15, required=False, allow_null=True, allow_blank=True)
@@ -86,5 +87,26 @@ class AuditLogSerializer(serializers.ModelSerializer):
         model=AuditLog
         fields='__all__'
     
+from .models import UsageLog
 
+class UsageLogSerializer(serializers.ModelSerializer):
+    # Optional: include nested user info if needed
+    username = serializers.CharField(source='user.username', read_only=True)
+    email = serializers.EmailField(source='user.email', read_only=True)
+
+    class Meta:
+        model = UsageLog
+        fields = [
+            'id',
+            'user',              # stores user ID
+            'username',          # optional, read-only
+            'email',             # optional, read-only
+            'file_hash',
+            'algorithm_name',
+            'confidence_score',
+            'usage_timestamp',
+            'blockchain_hash',
+            'transaction_hash',
+        ]
+        read_only_fields = ['usage_timestamp', 'blockchain_hash', 'transaction_hash']
 

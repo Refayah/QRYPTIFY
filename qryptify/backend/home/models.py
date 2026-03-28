@@ -27,6 +27,9 @@ class AuditLog(models.Model):
         ('CREATE', 'Create'),
         ('UPDATE', 'Update'),
         ('DELETE', 'Delete'),
+        ('VIEW_USER','View_User'),
+        ('VIEW_LOGS','View_Logs'),
+        ('UPLOAD_FILE','Upload_File')
     ]
     actor=models.ForeignKey(User,related_name='performed_actions',on_delete=models.SET_NULL,null=True)
     target_user=models.ForeignKey(User,related_name='affected_by',on_delete=models.SET_NULL,null=True, blank=True)
@@ -35,4 +38,20 @@ class AuditLog(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     def __str__(self):
         return self.message
+
+
+class UsageLog(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+
+    file_hash = models.CharField(max_length=256)
+    algorithm_name = models.CharField(max_length=100)
+    confidence_score = models.FloatField()
+
+    usage_timestamp = models.DateTimeField(auto_now_add=True)
+
+    blockchain_hash = models.CharField(max_length=256, null=True, blank=True)
+    transaction_hash = models.CharField(max_length=256, null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.user.username} - {self.algorithm_name}"
     

@@ -10,7 +10,7 @@ from rest_framework import status
 from home.models import User, AuditLog
 from home.audits import audit_logs
 from qryptify.settings import DEFAULT_TO_EMAIL1, DEFAULT_TO_EMAIL2, DEFAULT_TO_EMAIL3
-from .serializers import UserSerializer, AuditLogSerializer
+from .serializers import UserSerializer, AuditLogSerializer,UsageLogSerializer
 from django.contrib.auth import authenticate, login, logout
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import IsAuthenticated
@@ -20,11 +20,20 @@ from django.conf import settings
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
-from datetime import timedelta
+from datetime import timedelta,datetime
 from rest_framework.permissions import AllowAny
 from django.utils import timezone  
 from .nist_sts import *
 from django.contrib.auth import update_session_auth_hash
+import hashlib
+import json
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from django.utils import timezone
+from .models import UsageLog
+from .blockchain import contract, w3, account, PRIVATE_KEY
+from .permissions import *
+
 
 
 
@@ -34,10 +43,15 @@ def get_csrf_token(request):
     return JsonResponse({"token": get_token(request)}) 
 
 class GetLogsAPI(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated & (IsAdmin | IsAuditor)]
     def get(self, request):
         logs = AuditLog.objects.all()
         serializer = AuditLogSerializer(logs, many=True)
+        audit_logs(
+            actor=request.user,
+            action="VIEW_LOGS",
+            message=f"{request.user.username} viewed system audit logs"
+        )
         return Response({
             "status": True, 
             "log_data": serializer.data
@@ -252,6 +266,11 @@ class LoginAPI(APIView):
         if not users_obj.exists():
             return Response({"status": False, "message": "No user exists"}, status=status.HTTP_404_NOT_FOUND)
         serializers = UserSerializer(users_obj, many=True)
+        audit_logs(
+            actor=request.user,
+            action="VIEW_USERS",
+            message=f"{request.user.username} viewed the user list"
+        )
         return Response({"status": True, "data": serializers.data}, status=status.HTTP_200_OK)
 
     def post(self, request):
@@ -565,6 +584,7 @@ def convert_to_bits(data: str):
 
     
 class AnalyzeUserInputAPI(APIView):
+    permission_classes = [IsAuthenticated & (IsAdmin | IsResearcher | IsGuest)]
     ALLOWED_EXTENSIONS = ['.txt', '.dat', '.bin', '.enc', '.pdf', '.docx', '.doc']
     ALLOWED_MIME_TYPES = [
         'text/plain', 
@@ -612,6 +632,22 @@ class AnalyzeUserInputAPI(APIView):
                 feed_model=nist_statistical_test(data_bits)
                 if feed_model:
                     print(feed_model)
+                    user = request.user
+                    first_item = feed_model[0]
+                    rank1 = first_item['top5'][0]
+                    rank1_algorithm = rank1['algorithm']
+                    rank1_probability = rank1['probability']
+                    audit_logs(
+                        actor=request.user,
+                        action="UPLOAD_FILE",
+                        message=f"{request.user.username} uploaded a file for analysis"
+                    )
+                    store_usage_log_on_blockchain(user,encrypted_data_bytes,rank1_algorithm,rank1_probability)
+                    audit_logs(
+                        actor=request.user,
+                        action="STORE_BLOCKCHAIN",
+                        message=f"{request.user.username} stored analysis results on blockchain"
+                    )
                     return Response({"status":True,"predicted_results":feed_model})
                 else:
                     return Response({"status":False,"message":"Error in feeding the data to the model"})
@@ -621,3 +657,63 @@ class AnalyzeUserInputAPI(APIView):
         except Exception as e:
             print(f"CRITICAL ERROR in Try block: {e.__class__.__name__}: {str(e)}")
             return Response({"status": False, "message": f"Processing error: {str(e)}"}, status=500)
+
+
+def store_usage_log_on_blockchain(user, file_content, algorithm_name, confidence_score):
+    print(user)
+    user_id = user.id
+
+    if not user_id or not file_content:
+        return {"error": "Missing required fields"}  
+    file_hash = hashlib.sha256(file_content).hexdigest()
+
+    log = UsageLog.objects.create(
+        user=user,
+        file_hash=file_hash,
+        algorithm_name=algorithm_name,
+        confidence_score=confidence_score
+    )
+
+    blockchain_data = {
+        "user_id_hash": hashlib.sha256(str(user.id).encode()).hexdigest(),
+        "file_hash": file_hash,
+        "algorithm_name": algorithm_name,
+        "confidence_score": confidence_score,
+        "usage_timestamp": datetime.now().isoformat(),
+        "email_hash": hashlib.sha256(user.email.encode()).hexdigest(),
+        "username_hash": hashlib.sha256(user.username.encode()).hexdigest(),
+        "last_logged_in": user.last_login.isoformat() if user.last_login else None
+    }
+
+    final_string = json.dumps(blockchain_data, sort_keys=True)
+    final_hash = hashlib.sha256(final_string.encode()).hexdigest()
+
+    tx = contract.functions.addHash(final_hash).build_transaction({
+        "from": account.address,
+        "nonce": w3.eth.get_transaction_count(account.address),
+        "gas": 300000,
+        "gasPrice": w3.eth.gas_price
+    })
+
+    signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    log.blockchain_hash = final_hash
+    log.transaction_hash = tx_hash.hex()
+    log.save()
+
+    return {
+        "algorithm_name": algorithm_name,
+        "confidence_score": confidence_score,
+        "blockchain_hash": final_hash,
+        "transaction_hash": tx_hash.hex(),
+        "message": "File processed and hash stored on blockchain"
+    }
+
+class UsageLogAPI(APIView):
+    permission_classes = [AllowAny]
+    def get(self,request):
+        data=UsageLog.objects.all()
+        serializer = UsageLogSerializer(data, many=True)
+        return Response({"status":True,"data":serializer.data})

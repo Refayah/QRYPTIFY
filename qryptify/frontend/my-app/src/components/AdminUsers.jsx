@@ -149,10 +149,24 @@ export default function AdminUsers() {
           </td>
 
           {/* Delete Button */}
-          <td className="px-6 py-4 text-center">
+          {/* <td className="px-6 py-4 text-center">
             <button
               onClick={() => deleteUser(user.username)}
               className="px-4 py-2 text-xs font-semibold rounded-full bg-gradient-to-r from-red-500 to-red-600 text-white hover:from-red-600 hover:to-red-700 shadow-md transition-all duration-200"
+            >
+              Delete
+            </button>
+          </td> */}
+          <td className="px-6 py-4 text-center">
+            <button
+              onClick={() => deleteUser(user.username)}
+              disabled={user.role === "admin"}
+              className={`px-4 py-2 text-xs font-semibold rounded-full shadow-md transition-all duration-200
+                ${
+                  user.role === "admin"
+                    ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                    : "bg-gradient-to-r from-red-500 to-red-600 text-white hover:from-red-600 hover:to-red-700"
+                }`}
             >
               Delete
             </button>

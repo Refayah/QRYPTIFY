@@ -421,13 +421,32 @@ const createPageUrl = (page) => (page === 'Home' ? '/' : '/analysis');
 
 async function UploadFile({ file }) {
   try {
+    // try {
+    //     const result = await api('user-details', 'GET');
+    //     if (result.status && (result.user.role === 'auditor' || result.user.role === 'Auditor')) {
+    //       alert("Access denied: You don't have permission (Admin or Auditor role required)");
+    //       return;
+    //     }
+    //   } catch (error) {
+    //     console.error('Error fetching user details:', error);
+    //   }
     const formData = new FormData();
     formData.append('file', file);
     const result = await api('analyze-input-file', 'POST', formData);
+    if (result.error) {
+      if (result.error.includes('403')) {
+        console.log("User role not authorized - Status 403");
+        alert("Access denied: You don't have permission (Admin or Auditor role required)");
+        return;
+      }
+      console.log("Other error:", result.error);
+      return;
+    }
     if (result.status) {
       console.log("successfully processed the file");
       return result.predicted_results[0];
     } else {
+      if(result.status)
       console.log("error in processing the file");
     }
   } catch (e) {
@@ -441,6 +460,7 @@ const AppHeader = ({ onLogout }) => {
   const [showLogoutPopup, setShowLogoutPopup] = useState(false);
   const [logoutError, setLogoutError] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isAuditor,setIsAuditor]=useState(false);
 
   const { accessToken, setAccessToken, user } = useContext(AuthContext);
   const navigate = useNavigate();
@@ -451,6 +471,9 @@ const AppHeader = ({ onLogout }) => {
         const result = await api('user-details', 'GET');
         if (result.status && (result.user.role === 'admin' || result.user.role === 'Admin')) {
           setIsAdmin(true);
+        }
+        if (result.status && (result.user.role === 'auditor' || result.user.role === 'Auditor')) {
+          setIsAuditor(true);
         }
       } catch (error) {
         console.error('Error fetching user details:', error);
@@ -490,7 +513,7 @@ const AppHeader = ({ onLogout }) => {
           <div className="flex items-center justify-between h-16">
             <Logo />
             <div className="flex items-center gap-4 relative">
-              {isAdmin && (
+              {(isAdmin || isAuditor) && (
                 <>
                   <Button variant="outline" onClick={() => { setMenuOpen(false); navigate('/admin/users'); }}>
                     View Users
@@ -503,8 +526,8 @@ const AppHeader = ({ onLogout }) => {
               <a href={createPageUrl('Home')}>
                 <Button variant="outline">Home</Button>
               </a>
-              <div
-                className="w-10 h-10 bg-gray-200 rounded-full flex items-center justify-center cursor-pointer hover:bg-gray-300 transition-colors duration-200"
+             <div
+                className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center cursor-pointer"
                 onClick={() => setMenuOpen((prev) => !prev)}
               >
                 {user?.username ? (
@@ -667,7 +690,7 @@ const ResultsDisplay = ({ result, isLoading, error }) => {
     return (
       <div className="bg-white rounded-2xl shadow-lg border border-red-200 p-8 min-h-[280px] flex flex-col items-center justify-center text-center">
         <h3 className="text-2xl font-semibold text-red-700">Analysis Failed</h3>
-        <p className="text-red-500 mt-2">{error}</p>
+        {/* <p className="text-red-500 mt-2">{error}</p> */}
       </div>
     );
 
